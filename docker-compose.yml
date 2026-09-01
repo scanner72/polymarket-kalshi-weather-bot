@@ -20,7 +20,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: http://10.10.10.4:8600
+        # Baked into the Vite bundle at image build. The browser calls this URL,
+        # so it must be a host the client can reach (not a Docker-internal name).
+        # Override in .env if the dashboard is opened from another machine.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8600}
     container_name: weather-bot-frontend
     restart: unless-stopped
     ports:
