@@ -11,11 +11,46 @@ from backend.models.database import Trade, BotState, Signal
 logger = logging.getLogger("trading_bot")
 
 
+def _market_identifier_values(market: dict) -> List[str]:
+    """Identifiers Polymarket may use for a single market inside an event."""
+    values = []
+    for key in ("id", "slug", "ticker", "conditionId", "condition_id"):
+        val = market.get(key)
+        if val is not None and str(val) != "":
+            values.append(str(val))
+    return values
+
+
+def select_event_market(event: dict, market_id: str) -> Optional[dict]:
+    """Pick the traded market from an event, never a sibling ladder rung.
+
+    Weather events are negRisk ladders: many brackets share one event.
+    BTC 5-min events have a single market, so matching (or a one-market
+    fallback) keeps that flow working.
+    """
+    markets = event.get("markets") or []
+    if not markets:
+        return None
+
+    needle = str(market_id) if market_id is not None else ""
+    if needle:
+        for market in markets:
+            if needle in _market_identifier_values(market):
+                return market
+
+    # BTC (one market per event): still resolvable if the id field is missing.
+    if len(markets) == 1:
+        return markets[0]
+    return None
+
+
 async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] = None) -> Tuple[bool, Optional[float]]:
     """
     Fetch actual market resolution from Polymarket API.
 
-    For BTC 5-min markets, uses event slug to find the market.
+    Looks up the event by slug when provided, then resolves the *traded*
+    market (id / ticker / slug) inside that event. Weather ladders must
+    not use markets[0], which is some other bracket.
 
     Returns: (is_resolved, settlement_value)
         - settlement_value: 1.0 if Up won, 0.0 if Down won
@@ -33,9 +68,9 @@ async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] 
 
                 if events:
                     event = events[0] if isinstance(events, list) else events
-                    markets = event.get("markets", [])
-                    if markets:
-                        return _parse_market_resolution(markets[0])
+                    market = select_event_market(event, market_id)
+                    if market:
+                        return _parse_market_resolution(market)
 
             # Fallback: try market ID directly
             url = f"https://gamma-api.polymarket.com/markets/{market_id}"
