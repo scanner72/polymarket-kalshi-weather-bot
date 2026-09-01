@@ -6,33 +6,15 @@ from typing import List, Optional
 
 from backend.config import settings
 from backend.core.signals import calculate_edge, calculate_kelly_size
-from backend.data.weather import fetch_ensemble_forecast, EnsembleForecast, CITY_CONFIG
+from backend.data.weather import (
+    fetch_ensemble_forecast,
+    EnsembleForecast,
+    integer_temp_meets,
+)
 from backend.data.weather_markets import WeatherMarket, fetch_polymarket_weather_markets
 from backend.models.database import SessionLocal, Signal
 
 logger = logging.getLogger("trading_bot")
-
-# NOAA/METAR (the resolution source these markets settle on) reports the
-# daily high/low rounded to the nearest whole degree Fahrenheit, but the
-# Open-Meteo ensemble forecast is continuous. A bracket labeled at integer T
-# actually covers continuous forecast values down to T-0.5 (round-half-up
-# convention) - e.g. a raw forecast of 79.7F rounds to 80F and belongs to
-# the "80-81F" bracket, not "79F or below". Previously model_yes_prob and
-# the confidence/agreement calc each drew this boundary differently (and
-# neither applied the half-degree shift), so they could disagree with each
-# other and with what the market actually resolves on.
-HALF_DEGREE_F = 0.5
-
-
-def _bracket_bounds(market: WeatherMarket) -> tuple:
-    """Continuous-value bounds [lo, hi) that resolve this market's bracket,
-    shifted by HALF_DEGREE_F for NOAA/METAR's whole-degree rounding."""
-    if market.direction == "above":
-        return market.threshold_f - HALF_DEGREE_F, float("inf")
-    if market.direction == "below":
-        return float("-inf"), market.threshold_f + HALF_DEGREE_F
-    # "between" - a ladder bracket, e.g. Polymarket's "80-81F"
-    return market.threshold_f - HALF_DEGREE_F, market.threshold_high_f + HALF_DEGREE_F
 
 
 @dataclass
@@ -67,6 +49,79 @@ class WeatherTradingSignal:
         return abs(self.edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
 
 
+def _ensemble_members_for_market(forecast: EnsembleForecast, market: WeatherMarket) -> List[float]:
+    return forecast.member_highs if market.metric == "high" else forecast.member_lows
+
+
+def model_yes_probability(forecast: EnsembleForecast, market: WeatherMarket) -> Optional[float]:
+    """YES probability using the same integer-high definition as settlement.
+
+    Open-Meteo members are floats; NOAA/official highs are whole degrees.
+    '80-81°F' is P(round(h) in [80, 81]), not a mix of strict float cuts.
+    Returns None (with a warning) if a between-bracket is missing its high.
+    """
+    members = _ensemble_members_for_market(forecast, market)
+    if not members:
+        return None
+
+    if market.direction == "between" and market.threshold_high_f is None:
+        logger.warning(
+            "Skipping %s: between-bracket missing threshold_high_f",
+            getattr(market, "title", None) or market.slug,
+        )
+        return None
+
+    try:
+        yes_count = sum(
+            1 for m in members
+            if integer_temp_meets(
+                m, market.direction, market.threshold_f, market.threshold_high_f
+            )
+        )
+    except ValueError as e:
+        logger.warning(
+            "Skipping %s: %s",
+            getattr(market, "title", None) or market.slug,
+            e,
+        )
+        return None
+
+    return yes_count / len(members)
+
+
+def ensemble_yes_agreement(forecast: EnsembleForecast, market: WeatherMarket) -> Optional[float]:
+    """Ensemble agreement on YES vs NO (same integer definition as probability)."""
+    members = _ensemble_members_for_market(forecast, market)
+    if not members:
+        return None
+
+    if market.direction == "between" and market.threshold_high_f is None:
+        logger.warning(
+            "Skipping confidence for %s: between-bracket missing threshold_high_f",
+            getattr(market, "title", None) or market.slug,
+        )
+        return None
+
+    try:
+        yes_count = sum(
+            1 for m in members
+            if integer_temp_meets(
+                m, market.direction, market.threshold_f, market.threshold_high_f
+            )
+        )
+    except ValueError as e:
+        logger.warning(
+            "Skipping confidence for %s: %s",
+            getattr(market, "title", None) or market.slug,
+            e,
+        )
+        return None
+
+    n = len(members)
+    agreement_frac = max(yes_count, n - yes_count) / n
+    return min(0.9, agreement_frac)
+
+
 async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTradingSignal]:
     """
     Generate a trading signal for a weather temperature market.
@@ -80,15 +135,13 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     if not forecast or not forecast.member_highs:
         return None
 
-    # Model probability AND confidence/agreement both come from the same
-    # in-bracket member count, using the same NOAA-rounding-aware bounds -
-    # see _bracket_bounds(). Previously these were two (really three,
-    # counting the "above"/"below"/"between" cases separately) independently
-    # written formulas that didn't agree with each other.
-    members = forecast.member_highs if market.metric == "high" else forecast.member_lows
-    lo, hi = _bracket_bounds(market)
-    in_bracket = sum(1 for m in members if lo <= m < hi)
-    model_yes_prob = in_bracket / len(members) if members else 0.5
+    model_yes_prob = model_yes_probability(forecast, market)
+    if model_yes_prob is None:
+        return None
+
+    agreement_frac = ensemble_yes_agreement(forecast, market)
+    if agreement_frac is None:
+        return None
 
     # Clip extreme probabilities (ensemble can be unanimous but don't bet 100%)
     model_yes_prob = max(0.05, min(0.95, model_yes_prob))
@@ -104,10 +157,7 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
         edge = 0.0  # Zero out but still return for UI visibility
 
-    # Confidence = ensemble agreement (how one-sided the members are),
-    # reusing the same in_bracket count as model_yes_prob above.
-    agreement_frac = max(in_bracket, len(members) - in_bracket) / len(members) if members else 0.5
-    confidence = min(0.9, agreement_frac)
+    confidence = agreement_frac
 
     # Kelly sizing
     bankroll = settings.INITIAL_BANKROLL

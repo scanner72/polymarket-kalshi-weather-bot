@@ -69,16 +69,28 @@ class WeatherMarket:
     threshold_high_f: Optional[float] = None
 
 
+def _alias_token_pattern(alias: str) -> re.Pattern:
+    """Whole-token pattern so short aliases like 'la' do not match inside names."""
+    return re.compile(
+        r'(?<![a-z0-9])' + re.escape(alias) + r'(?![a-z0-9])',
+        re.IGNORECASE,
+    )
+
+
 def _match_city(text: str) -> Tuple[Optional[str], Optional[str]]:
     """Match a city name fragment (from an event title) to our city keys.
 
-    Word-boundary match, not substring - a plain `alias in text_lower` check
-    matched "la" inside "atlanta" and "philadelphia" (and "las" inside "las
-    vegas"), silently mis-tagging those cities' markets as Los Angeles.
+    Aliases match as whole words/tokens only. Substring matching would map
+    Atlanta / Philadelphia / Las Vegas / Dallas onto Los Angeles via the
+    "la" alias. Unlisted cities return (None, None) instead of being
+    silently remapped to a configured city.
     """
     text_lower = text.lower().strip()
+    if not text_lower:
+        return None, None
+
     for alias, key in sorted(CITY_ALIASES.items(), key=lambda x: -len(x[0])):
-        if re.search(rf'\b{re.escape(alias)}\b', text_lower):
+        if _alias_token_pattern(alias).search(text_lower):
             from backend.data.weather import CITY_CONFIG
             return key, CITY_CONFIG[key]["name"]
     return None, None

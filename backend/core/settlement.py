@@ -12,11 +12,50 @@ from backend.models.database import Trade, BotState, Signal
 logger = logging.getLogger("trading_bot")
 
 
+def _market_identifier_values(market: dict) -> List[str]:
+    """Identifiers Polymarket may use for a single market inside an event."""
+    values = []
+    for key in ("id", "slug", "ticker", "conditionId", "condition_id"):
+        val = market.get(key)
+        if val is not None and str(val) != "":
+            values.append(str(val))
+    return values
+
+
+def select_event_market(event: dict, market_id: str) -> Optional[dict]:
+    """Pick the traded market from an event, never a sibling ladder rung.
+
+    Weather events are negRisk ladders: many brackets share one event.
+    BTC 5-min events have a single market, so matching (or a one-market
+    fallback) keeps that flow working. Returns None (rather than guessing
+    via markets[0]) when a specific market_id can't be found in a
+    multi-market event - the earlier version of this code always used
+    markets[0], which resolved every weather trade against the FIRST
+    bracket regardless of which one was actually traded.
+    """
+    markets = event.get("markets") or []
+    if not markets:
+        return None
+
+    needle = str(market_id) if market_id is not None else ""
+    if needle:
+        for market in markets:
+            if needle in _market_identifier_values(market):
+                return market
+
+    # BTC (one market per event): still resolvable if the id field is missing.
+    if len(markets) == 1:
+        return markets[0]
+    return None
+
+
 async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] = None) -> Tuple[bool, Optional[float]]:
     """
     Fetch actual market resolution from Polymarket API.
 
-    For BTC 5-min markets, uses event slug to find the market.
+    Looks up the event by slug when provided, then resolves the *traded*
+    market (id / slug / ticker / conditionId) inside that event - see
+    select_event_market().
 
     Returns: (is_resolved, settlement_value)
         - settlement_value: 1.0 if Up won, 0.0 if Down won
@@ -34,21 +73,9 @@ async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] 
 
                 if events:
                     event = events[0] if isinstance(events, list) else events
-                    markets = event.get("markets", [])
-                    # BTC 5-min events have exactly one market, so markets[0]
-                    # was always correct there. Weather ladder events have
-                    # ~10-11 markets (one per bracket) sharing this event_slug
-                    # - blindly using markets[0] resolved every weather trade
-                    # against the FIRST bracket ("...F or below"), not
-                    # whichever bracket market_id was actually traded, so
-                    # win/loss and P&L were being recorded against the wrong
-                    # market. Match by id; only fall back to markets[0] if
-                    # this specific market can't be found in the event.
-                    target = next((m for m in markets if str(m.get("id")) == str(market_id)), None)
-                    if target is not None:
-                        return _parse_market_resolution(target)
-                    if markets:
-                        return _parse_market_resolution(markets[0])
+                    market = select_event_market(event, market_id)
+                    if market:
+                        return _parse_market_resolution(market)
 
             # Fallback: try market ID directly
             url = f"https://gamma-api.polymarket.com/markets/{market_id}"
