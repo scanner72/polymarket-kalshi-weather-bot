@@ -70,10 +70,15 @@ class WeatherMarket:
 
 
 def _match_city(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Match a city name fragment (from an event title) to our city keys."""
+    """Match a city name fragment (from an event title) to our city keys.
+
+    Word-boundary match, not substring - a plain `alias in text_lower` check
+    matched "la" inside "atlanta" and "philadelphia" (and "las" inside "las
+    vegas"), silently mis-tagging those cities' markets as Los Angeles.
+    """
     text_lower = text.lower().strip()
     for alias, key in sorted(CITY_ALIASES.items(), key=lambda x: -len(x[0])):
-        if alias in text_lower:
+        if re.search(rf'\b{re.escape(alias)}\b', text_lower):
             from backend.data.weather import CITY_CONFIG
             return key, CITY_CONFIG[key]["name"]
     return None, None
